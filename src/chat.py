@@ -11,6 +11,8 @@ Comandos dentro del chat:
     /json on|off        salida estructurada con JSON Schema (slot 3)
     /contexto <archivos>  carga contexto estático; en el slot 2 va marcado
                           con cache_control para provocar cache hits
+    /prompt <archivo>   manda el contenido de un archivo como UN turno
+    /guardar <destino>  escribe el código de la última respuesta en un archivo
     /resumen            totales de la conversación en curso
     /salir              cierra el log y termina
 """
@@ -19,6 +21,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import extraccion  # noqa: E402
 import openrouter  # noqa: E402
 import registro  # noqa: E402
 
@@ -123,6 +126,7 @@ def _bucle(conv, modelo):
     mensajes = []
     effort = None
     json_on = False
+    ultima_respuesta = ""
 
     while True:
         try:
@@ -176,12 +180,54 @@ def _bucle(conv, modelo):
                          else " (cache automático por prefijo)\n"))
             continue
 
-        if entrada.startswith("/"):
+        if entrada.startswith("/guardar"):
+            partes = entrada.split(maxsplit=1)
+            if len(partes) < 2:
+                print("  Uso: /guardar vida.py\n")
+                continue
+            if not ultima_respuesta:
+                print("  Todavía no hay ninguna respuesta que guardar.\n")
+                continue
+            codigo = extraccion.extraer_codigo(ultima_respuesta)
+            if not extraccion.parece_script_python(codigo):
+                print("  La última respuesta no parece un script de Python. "
+                      "No guardo nada.\n")
+                continue
+            destino = Path(partes[1].strip())
+            if not destino.is_absolute():
+                destino = RAIZ / destino
+            destino.write_text(codigo, encoding="utf-8")
+            print(f"  Guardado {destino.name}: {len(codigo.splitlines())} líneas, "
+                  f"tal cual lo devolvió el modelo (sin tocar nada).\n")
+            continue
+
+        if entrada.startswith("/prompt"):
+            # El prompt se manda desde un archivo para que viaje como UN
+            # solo turno: pegar varias líneas en el input las mandaría como
+            # varios prompts. Además el archivo queda versionado, que es lo
+            # que garantiza que el prefijo estático sea idéntico entre
+            # intentos y que el cache pegue.
+            partes = entrada.split(maxsplit=1)
+            if len(partes) < 2:
+                print("  Uso: /prompt prompts/conway-v1.md\n")
+                continue
+            archivo = Path(partes[1].strip())
+            if not archivo.is_absolute():
+                archivo = RAIZ / archivo
+            if not archivo.exists():
+                print(f"  No encuentro {archivo}\n")
+                continue
+            entrada = archivo.read_text(encoding="utf-8")
+            print(f"  Prompt cargado de {archivo.name}: "
+                  f"{len(entrada.splitlines())} líneas, {len(entrada)} caracteres.")
+            print("  Va como un único turno de usuario.\n")
+
+        elif entrada.startswith("/"):
             # Un comando mal escrito NO se manda al modelo: costaría tokens
             # y, peor, sumaría un turno de usuario al log. La rúbrica cuenta
             # esos turnos para decidir si la corrida fue "1 prompt".
-            print(f"  '{entrada.split()[0]}' no es un comando. "
-                  f"Disponibles: /modelo /effort /json /contexto /resumen /salir")
+            print(f"  '{entrada.split()[0]}' no es un comando. Disponibles: "
+                  f"/modelo /effort /json /contexto /prompt /guardar /resumen /salir")
             print("  (si querías mandarlo como mensaje, escribilo sin la barra)\n")
             continue
 
@@ -207,6 +253,7 @@ def _bucle(conv, modelo):
 
         texto = openrouter.texto_de(respuesta)
         uso = openrouter.extraer_usage(respuesta)
+        ultima_respuesta = texto
 
         print(f"\n  {modelo['nombre']} >\n")
         print("  " + texto.replace("\n", "\n  "))
