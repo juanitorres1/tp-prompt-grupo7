@@ -176,6 +176,15 @@ def _bucle(conv, modelo):
                          else " (cache automático por prefijo)\n"))
             continue
 
+        if entrada.startswith("/"):
+            # Un comando mal escrito NO se manda al modelo: costaría tokens
+            # y, peor, sumaría un turno de usuario al log. La rúbrica cuenta
+            # esos turnos para decidir si la corrida fue "1 prompt".
+            print(f"  '{entrada.split()[0]}' no es un comando. "
+                  f"Disponibles: /modelo /effort /json /contexto /resumen /salir")
+            print("  (si querías mandarlo como mensaje, escribilo sin la barra)\n")
+            continue
+
         mensajes.append({"role": "user", "content": entrada})
         parametros = []
         if effort:
