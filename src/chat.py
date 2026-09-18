@@ -1,0 +1,229 @@
+"""Interfaz de chat sobre OpenRouter: cuatro modelos, un solo endpoint.
+
+Uso:
+
+    python src/chat.py            (en Git Bash: winpty python src/chat.py)
+
+Comandos dentro del chat:
+
+    /modelo             elegir otro modelo (arranca conversación nueva)
+    /effort <nivel>     low | medium | high | off   (slot 1)
+    /json on|off        salida estructurada con JSON Schema (slot 3)
+    /contexto <archivos>  carga contexto estático; en el slot 2 va marcado
+                          con cache_control para provocar cache hits
+    /resumen            totales de la conversación en curso
+    /salir              cierra el log y termina
+"""
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import openrouter  # noqa: E402
+import registro  # noqa: E402
+
+RAIZ = Path(__file__).resolve().parent.parent
+CARPETA_LOGS = RAIZ / "logs"
+
+# Esquema de ejemplo para el slot 3. La consigna pide ejercitar salidas
+# estructuradas; con esto la respuesta viene como JSON validado.
+ESQUEMA_JSON = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "respuesta_estructurada",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "respuesta": {"type": "string"},
+                "confianza": {"type": "number"},
+                "supuestos": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["respuesta", "confianza", "supuestos"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+
+def elegir_modelo():
+    print("\n  Modelos disponibles\n")
+    for slot, m in openrouter.MODELOS.items():
+        print(f"    {slot}. {m['nombre']:<20} {m['id']}")
+        print(f"       {m['proveedor']} · {m['capacidad']}")
+        print(f"       ${m['precio_entrada']}/M entrada · "
+              f"${m['precio_salida']}/M salida\n")
+    while True:
+        slot = input("  Slot (1-4): ").strip()
+        if slot in openrouter.MODELOS:
+            return slot, openrouter.MODELOS[slot]
+        print("  No existe ese slot.")
+
+
+def bloque_sistema(texto, con_cache):
+    """El contexto estático, marcado para cachear si el modelo lo soporta.
+
+    Anthropic y Qwen necesitan la marca explícita `cache_control`; en
+    OpenAI, Gemini y DeepSeek el cache es automático por prefijo repetido.
+    """
+    if con_cache:
+        return {
+            "role": "system",
+            "content": [{
+                "type": "text",
+                "text": texto,
+                "cache_control": {"type": "ephemeral"},
+            }],
+        }
+    return {"role": "system", "content": texto}
+
+
+def cargar_contexto(rutas):
+    partes = []
+    for r in rutas:
+        archivo = Path(r)
+        if not archivo.is_absolute():
+            archivo = RAIZ / r
+        if not archivo.exists():
+            print(f"  No encuentro {archivo}")
+            continue
+        partes.append(f"### {archivo.name}\n\n"
+                      + archivo.read_text(encoding="utf-8"))
+        print(f"  Cargado {archivo.name} ({archivo.stat().st_size} bytes)")
+    return "\n\n".join(partes)
+
+
+def mostrar_usage(uso, modelo, acumulado):
+    ahorro = openrouter.ahorro_por_cache(uso, modelo)
+    print(f"\n  ── usage ──────────────────────────────────────")
+    print(f"     entrada       {uso['entrada']:>8}")
+    print(f"     salida        {uso['salida']:>8}")
+    print(f"     razonamiento  {uso['razonamiento']:>8}")
+    print(f"     cacheados     {uso['cacheados']:>8}"
+          + (f"   (ahorro ${ahorro:.6f})" if ahorro else ""))
+    print(f"     costo         ${uso['costo']:.6f}")
+    print(f"     acumulado     ${acumulado:.6f}")
+    print(f"  ───────────────────────────────────────────────\n")
+
+
+def sesion(slot, modelo):
+    """Una conversación con un modelo. Cambiar de modelo termina esta."""
+    conv = registro.Conversacion(CARPETA_LOGS, slot, modelo)
+    print(f"\n  Conversación nueva con {modelo['nombre']}")
+    print(f"  Log: {conv.ruta.relative_to(RAIZ)}\n")
+    try:
+        return _bucle(conv, modelo)
+    finally:
+        # El total va al pie del log pase lo que pase: si el proceso se
+        # corta, el archivo igual queda cerrado y auditable.
+        conv.cerrar()
+
+
+def _bucle(conv, modelo):
+    mensajes = []
+    effort = None
+    json_on = False
+
+    while True:
+        try:
+            entrada = input("  vos > ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return "salir"
+
+        if not entrada:
+            continue
+
+        if entrada == "/salir":
+            return "salir"
+
+        if entrada == "/modelo":
+            return "cambiar"
+
+        if entrada == "/resumen":
+            t = conv.totales
+            print(f"\n  prompts {conv.turnos} · entrada {t['entrada']} · "
+                  f"salida {t['salida']} · razonamiento {t['razonamiento']} · "
+                  f"cacheados {t['cacheados']} · costo ${t['costo']:.6f}\n")
+            continue
+
+        if entrada.startswith("/effort"):
+            nivel = entrada.split(maxsplit=1)[-1].strip().lower()
+            if nivel in ("low", "medium", "high"):
+                effort = nivel
+                print(f"  reasoning.effort = {nivel}\n")
+            else:
+                effort = None
+                print("  reasoning desactivado\n")
+            continue
+
+        if entrada.startswith("/json"):
+            json_on = entrada.endswith("on")
+            print(f"  salida estructurada {'activada' if json_on else 'desactivada'}\n")
+            continue
+
+        if entrada.startswith("/contexto"):
+            rutas = entrada.split()[1:]
+            if not rutas:
+                print("  Uso: /contexto archivo1 [archivo2 ...]\n")
+                continue
+            texto = cargar_contexto(rutas)
+            if texto:
+                con_cache = modelo["proveedor"] == "Anthropic"
+                mensajes = [bloque_sistema(texto, con_cache)] + [
+                    m for m in mensajes if m.get("role") != "system"]
+                print(f"  Contexto estático cargado"
+                      + (" con cache_control\n" if con_cache
+                         else " (cache automático por prefijo)\n"))
+            continue
+
+        mensajes.append({"role": "user", "content": entrada})
+        parametros = []
+        if effort:
+            parametros.append(f"reasoning.effort={effort}")
+        if json_on:
+            parametros.append("response_format=json_schema")
+        conv.anotar("user", entrada,
+                    parametros=", ".join(parametros) or None)
+
+        try:
+            respuesta = openrouter.pedir(
+                modelo["id"], mensajes,
+                reasoning={"effort": effort} if effort else None,
+                response_format=ESQUEMA_JSON if json_on else None,
+            )
+        except openrouter.ErrorOpenRouter as e:
+            print(f"\n  Error: {e}\n")
+            mensajes.pop()
+            continue
+
+        texto = openrouter.texto_de(respuesta)
+        uso = openrouter.extraer_usage(respuesta)
+
+        print(f"\n  {modelo['nombre']} >\n")
+        print("  " + texto.replace("\n", "\n  "))
+
+        mensajes.append({"role": "assistant", "content": texto})
+        conv.anotar("assistant", texto, uso)
+        mostrar_usage(uso, modelo, conv.totales["costo"])
+
+
+def main():
+    print("\n" + "=" * 60)
+    print("  Chat sobre OpenRouter — TP: el prompt mínimo")
+    print("=" * 60)
+    try:
+        openrouter.cargar_key()
+    except openrouter.ErrorOpenRouter as e:
+        print(f"\n  {e}\n")
+        return 1
+
+    while True:
+        slot, modelo = elegir_modelo()
+        accion = sesion(slot, modelo)
+        if accion == "salir":
+            print("\n  Listo. Los logs quedaron en logs/\n")
+            return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
