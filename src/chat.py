@@ -57,7 +57,11 @@ def elegir_modelo():
         print(f"       ${m['precio_entrada']}/M entrada · "
               f"${m['precio_salida']}/M salida\n")
     while True:
-        slot = input("  Slot (1-4): ").strip()
+        try:
+            slot = input("  Slot (1-4): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n")
+            return None, None
         if slot in openrouter.MODELOS:
             return slot, openrouter.MODELOS[slot]
         print("  No existe ese slot.")
@@ -263,7 +267,80 @@ def _bucle(conv, modelo):
         mostrar_usage(uso, modelo, conv.totales["costo"])
 
 
+def una_sola_llamada(slot, ruta_prompt, effort=None, destino=None,
+                     etiqueta=None):
+    """Un intento: un prompt desde archivo, una respuesta, y se cierra.
+
+    Existe para la corrida del ejercicio 2. Garantiza por construcción que
+    el log tenga exactamente un turno de usuario: no hay input interactivo
+    donde se pueda colar un typo o un pegado partido en varias líneas.
+    """
+    modelo = openrouter.MODELOS[slot]
+    archivo = Path(ruta_prompt)
+    if not archivo.is_absolute():
+        archivo = RAIZ / archivo
+    if not archivo.exists():
+        print(f"  No encuentro {archivo}")
+        return 1
+    prompt = archivo.read_text(encoding="utf-8")
+
+    conv = registro.Conversacion(CARPETA_LOGS, slot, modelo, etiqueta=etiqueta)
+    print(f"\n  Modelo: {modelo['nombre']} ({modelo['id']})")
+    print(f"  Prompt: {archivo.name} — {len(prompt.splitlines())} líneas, "
+          f"{len(prompt)} caracteres")
+    if effort:
+        print(f"  reasoning.effort = {effort}")
+    print(f"  Log: {conv.ruta.relative_to(RAIZ)}")
+    print("\n  Mandando un único turno de usuario...\n")
+
+    parametros = f"reasoning.effort={effort}" if effort else None
+    conv.anotar("user", prompt, parametros=parametros)
+
+    try:
+        respuesta = openrouter.pedir(
+            modelo["id"], [{"role": "user", "content": prompt}],
+            reasoning={"effort": effort} if effort else None,
+        )
+    except openrouter.ErrorOpenRouter as e:
+        print(f"  Error: {e}\n")
+        conv.cerrar()
+        return 1
+
+    texto = openrouter.texto_de(respuesta)
+    uso = openrouter.extraer_usage(respuesta)
+    conv.anotar("assistant", texto, uso)
+    mostrar_usage(uso, modelo, conv.totales["costo"])
+
+    if destino:
+        codigo = extraccion.extraer_codigo(texto)
+        if not extraccion.parece_script_python(codigo):
+            print("  La respuesta no parece un script de Python. No guardo nada.\n")
+        else:
+            salida = Path(destino)
+            if not salida.is_absolute():
+                salida = RAIZ / salida
+            salida.write_text(codigo, encoding="utf-8")
+            print(f"  Guardado {salida.name}: {len(codigo.splitlines())} líneas, "
+                  f"tal cual lo devolvió el modelo.\n")
+
+    conv.cerrar()
+    print(f"  Log cerrado: {conv.ruta.relative_to(RAIZ)}")
+    print(f"  Prompts del usuario en este log: {conv.turnos}\n")
+    return 0
+
+
 def main():
+    import argparse
+
+    ap = argparse.ArgumentParser(
+        description="Chat sobre OpenRouter. Sin argumentos abre el modo interactivo.")
+    ap.add_argument("--slot", choices=sorted(openrouter.MODELOS))
+    ap.add_argument("--prompt", help="archivo con el prompt; se manda como un turno")
+    ap.add_argument("--effort", choices=["low", "medium", "high"])
+    ap.add_argument("--guardar", help="dónde escribir el código de la respuesta")
+    ap.add_argument("--etiqueta", help="sufijo para el nombre del log, ej: intento-1")
+    args = ap.parse_args()
+
     print("\n" + "=" * 60)
     print("  Chat sobre OpenRouter — TP: el prompt mínimo")
     print("=" * 60)
@@ -273,8 +350,18 @@ def main():
         print(f"\n  {e}\n")
         return 1
 
+    if args.prompt:
+        if not args.slot:
+            print("\n  --prompt necesita --slot\n")
+            return 2
+        return una_sola_llamada(args.slot, args.prompt, args.effort,
+                                args.guardar, args.etiqueta)
+
     while True:
         slot, modelo = elegir_modelo()
+        if slot is None:
+            print("  Listo.\n")
+            return 0
         accion = sesion(slot, modelo)
         if accion == "salir":
             print("\n  Listo. Los logs quedaron en logs/\n")
