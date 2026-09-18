@@ -19,6 +19,17 @@ Comandos dentro del chat:
 import sys
 from pathlib import Path
 
+# En Git Bash, Python no reconoce la salida como terminal y la bufferea:
+# el proceso corre pero no se ve nada hasta que termina. Con line_buffering
+# cada print sale en el momento.
+try:
+    # errors="replace" evita que un acento o un guión largo tumbe el
+    # proceso en consolas cp1252, que es lo normal en Windows.
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace",
+                           line_buffering=True)
+except (AttributeError, ValueError):
+    pass
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import extraccion  # noqa: E402
@@ -101,8 +112,11 @@ def cargar_contexto(rutas):
 
 
 def mostrar_usage(uso, modelo, acumulado):
+    # Solo ASCII: la consola de Windows (cp1252) no dibuja cajas Unicode y
+    # un UnicodeEncodeError acá tumbaría la corrida después de haber pagado
+    # la llamada.
     ahorro = openrouter.ahorro_por_cache(uso, modelo)
-    print(f"\n  ── usage ──────────────────────────────────────")
+    print("\n  -- usage " + "-" * 38)
     print(f"     entrada       {uso['entrada']:>8}")
     print(f"     salida        {uso['salida']:>8}")
     print(f"     razonamiento  {uso['razonamiento']:>8}")
@@ -110,7 +124,7 @@ def mostrar_usage(uso, modelo, acumulado):
           + (f"   (ahorro ${ahorro:.6f})" if ahorro else ""))
     print(f"     costo         ${uso['costo']:.6f}")
     print(f"     acumulado     ${acumulado:.6f}")
-    print(f"  ───────────────────────────────────────────────\n")
+    print("  " + "-" * 47 + "\n")
 
 
 def sesion(slot, modelo):
@@ -305,6 +319,14 @@ def una_sola_llamada(slot, ruta_prompt, effort=None, destino=None,
         print(f"  Error: {e}\n")
         conv.cerrar()
         return 1
+    except KeyboardInterrupt:
+        # El log queda cerrado igual, con la nota de que no hubo respuesta:
+        # un intento interrumpido no es un intento, pero tampoco se oculta.
+        conv.anotar("sistema", "Llamada interrumpida por el usuario: "
+                               "no hubo respuesta del modelo.")
+        conv.cerrar()
+        print("\n  Interrumpido. El log quedó cerrado sin respuesta.\n")
+        return 130
 
     texto = openrouter.texto_de(respuesta)
     uso = openrouter.extraer_usage(respuesta)
